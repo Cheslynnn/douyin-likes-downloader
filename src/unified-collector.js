@@ -1,0 +1,329 @@
+// 在自己抖音主页的「作品」页运行，然后点击「喜欢」。不刷新页面。
+// 只读取网页正常加载的喜欢列表响应；不会主动请求接口或更改点赞。
+(() => {
+  'use strict';
+  if (!/(^|\.)douyin\.com$/.test(location.hostname)) {
+    alert('请先在抖音网页版的个人主页运行。');
+    return;
+  }
+  if (window.__douyinLikesExport) {
+    window.__douyinLikesExport.stop(); document.querySelector('[data-unified-collector]')?.remove(); delete window.__douyinLikesExport;
+  }
+
+  const pages = new Map();
+  let account = '', active = true, message = '正在准备喜欢列表，请稍候。';
+  let autoTimer = null, lastProgress = Date.now();
+  const xhrUrls = new WeakMap();
+  const originalFetch = window.fetch;
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+
+  function mediaFor(item, note) {
+    const urls = (...lists) => [...new Set(lists.flat().filter(value => typeof value === 'string' && /^https?:\/\//.test(value)))];
+    if (!note) {
+      const video = item.video || {};
+      const candidates = urls(video.play_addr?.url_list || [], video.play_addr_h264?.url_list || [],
+        ...(Array.isArray(video.bit_rate) ? video.bit_rate : []).map(rate => rate?.play_addr?.url_list || []));
+      return candidates.length ? [{ kind: 'video', urls: candidates }] : [];
+    }
+    // 使用包含图片最多的正文图片列表，保留每张图片各自的候选地址。
+    const lists = [item.images, item.image_post_info?.images, item.image_list, item.image_post_info?.image_list]
+      .filter(value => Array.isArray(value) && value.length);
+    const images = lists.sort((a, b) => b.length - a.length)[0] || [];
+    function imageUrls(value, depth = 0) {
+      if (depth > 5 || value == null) return [];
+      if (typeof value === 'string') return /^https?:\/\//.test(value) ? [value] : [];
+      if (Array.isArray(value)) return value.flatMap(v => imageUrls(v, depth + 1));
+      if (typeof value !== 'object') return [];
+      return ['origin_image','original_image','url_list','display_image','display_url','download_url_list','download_url','owner_watermark_image']
+        .flatMap(key => imageUrls(value[key], depth + 1));
+    }
+    return images.map(image => ({ kind: 'image', urls: [...new Set(imageUrls(image))] }));
+  }
+
+  function target(input) {
+    try {
+      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
+      return url.origin === location.origin && /^\/aweme\/v1\/web\/aweme\/favorite\/?$/.test(url.pathname) ? url : null;
+    } catch { return null; }
+  }
+
+  function summary() {
+    const ordered = [], seenCursors = new Set();
+    let cursor = '0', complete = false;
+    while (pages.has(cursor) && !seenCursors.has(cursor)) {
+      seenCursors.add(cursor);
+      const page = pages.get(cursor);
+      ordered.push(page);
+      if (page.end) { complete = true; break; }
+      if (!page.next || page.next === cursor) break;
+      cursor = page.next;
+    }
+    // 未接上的分页也保留，便于在中断时导出已采集结果。
+    for (const [key, page] of pages) if (!seenCursors.has(key)) ordered.push(page);
+    const items = new Map();
+    let invalid = 0;
+    for (const page of ordered) {
+      invalid += page.invalid;
+      for (const item of page.items) if (!items.has(item.id)) items.set(item.id, item);
+    }
+    return { items: [...items.values()], complete: complete && invalid === 0, invalid, pages: pages.size, first: pages.has('0') };
+  }
+
+  function pause() {
+    if (autoTimer !== null) clearInterval(autoTimer);
+    autoTimer = null;
+    autoButton.textContent = '开始自动滚动';
+  }
+
+  function render() {
+    const s = summary();
+    const notes = s.items.filter(item => item.note).length;
+    count.textContent = `已采集：视频 ${s.items.length - notes} 条，图文 ${notes} 条（${s.pages} 页）`;
+    state.textContent = s.complete ? '已从首页连续采集至接口末页；可导出。' : message;
+    if (s.pages && !s.first) state.textContent += ' 缺少首页：请按说明从自己的「作品」页刷新后重新开始。';
+    if (s.invalid) state.textContent += ` 有 ${s.invalid} 条数据无法识别，不能确认完整。`;
+    if (s.complete) pause();
+  }
+
+  function accept(url, data) {
+    if (!active || !url) return;
+    const who = url.searchParams.get('sec_user_id');
+    if (!who) { message = '接口缺少账号标识，无法安全归并；请反馈该提示。'; render(); return; }
+    if (account && account !== who) { message = '检测到其他账号，已忽略；请留在自己的喜欢列表。'; render(); return; }
+    if (!data || (data.status_code !== undefined && Number(data.status_code) !== 0)) {
+      message = '喜欢列表请求未成功，请检查登录或页面验证后重试滚动。'; render(); return;
+    }
+    const end = data.has_more === 0 || data.has_more === false || data.has_more === '0';
+    if (!Array.isArray(data.aweme_list) && !(end && data.aweme_list == null)) {
+      message = '未识别到喜欢列表，无法确认完整；请反馈该提示。'; render(); return;
+    }
+    if (!account) account = who;
+    const items = [];
+    let invalid = 0;
+    for (const item of data.aweme_list || []) {
+      // 不把可能已被 JSON 舍入的数字 ID 转成链接。
+      if (!item || typeof item.aweme_id !== 'string' || !/^\d+$/.test(item.aweme_id)) { invalid++; continue; }
+      const note = [2, 68, 150].includes(Number(item.aweme_type)) ||
+        (Array.isArray(item.images) && item.images.length > 0) ||
+        (Array.isArray(item.image_post_info?.images) && item.image_post_info.images.length > 0);
+      items.push({ id: item.aweme_id, note, title: String(item.desc || ''),
+        author: String(item.author?.nickname || ''), assets: mediaFor(item, note) });
+    }
+    const cursor = url.searchParams.get('max_cursor') || '0';
+    const next = data.max_cursor == null ? '' : String(data.max_cursor);
+    pages.set(cursor, { items, next, end, invalid });
+    lastProgress = Date.now();
+    message = '正在采集。请继续向下滚动加载；尚未确认到达末页。';
+    render();
+  }
+
+  async function wrappedFetch(...args) {
+    const response = await originalFetch.apply(this, args);
+    const url = target(args[0]);
+    if (url && active) {
+      try {
+        response.clone().json().then(data => accept(url, data)).catch(() => {
+          if (active) { message = '喜欢列表响应未能解析，不能确认完整。'; render(); }
+        });
+      } catch { /* 不影响网页原有请求 */ }
+    }
+    return response;
+  }
+
+  function wrappedOpen(method, url, ...args) {
+    xhrUrls.set(this, target(url));
+    return originalOpen.call(this, method, url, ...args);
+  }
+
+  function wrappedSend(...args) {
+    const url = xhrUrls.get(this);
+    if (url) this.addEventListener('load', () => {
+      if (!active) return;
+      try {
+        if (this.status < 200 || this.status >= 300) throw new Error('HTTP');
+        accept(url, this.responseType === 'json' ? this.response : JSON.parse(this.responseText));
+      } catch { message = '喜欢列表响应未能解析，请检查登录或页面验证。'; render(); }
+    }, { once: true });
+    return originalSend.apply(this, args);
+  }
+
+  function exportTxt(type) {
+    const s = summary();
+    const label = type === 'all' ? '全部作品' : type === 'note' ? '图文' : '视频';
+    const items = s.items.filter(item => type === 'all' || (type === 'note' ? item.note : !item.note));
+    if (!items.length) { alert(`还没有采集到${label}链接。请先点击「喜欢」并继续滚动加载。`); return; }
+    const content = items.map(item => `https://www.douyin.com/${item.note ? 'note' : 'video'}/${item.id}`).join('\r\n') + '\r\n';
+    const blobUrl = URL.createObjectURL(new Blob(['\uFEFF', content], { type: 'text/plain;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = `抖音喜欢${label}链接_${s.complete ? '已到末页' : '未确认完整'}_${items.length}条.txt`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+  }
+
+  function scrollOnce() {
+    if (!active || summary().complete) { pause(); return; }
+    if (Date.now() - lastProgress > 30000) {
+      pause(); message = '30 秒未采集到新分页，自动滚动已暂停。请检查验证、登录或手动滚动；尚未确认完整。'; render(); return;
+    }
+    // 从屏幕中间寻找列表所在的可滚动容器；找不到时滚动文档。
+    let el = document.elementFromPoint(Math.floor(innerWidth * 0.5), Math.floor(innerHeight * 0.65));
+    while (el && el !== document.body) {
+      if (el.scrollHeight > el.clientHeight + 20 && /auto|scroll/.test(getComputedStyle(el).overflowY)) break;
+      el = el.parentElement;
+    }
+    const container = el && el !== document.body ? el : document.scrollingElement;
+    container?.scrollBy({ top: Math.max(400, container.clientHeight * 0.8), behavior: 'smooth' });
+  }
+
+  let exporting = false;
+  async function detailImages(item) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const url = '/aweme/v1/web/aweme/detail?' + new URLSearchParams({aid:'6383', version_code:'190500', aweme_id:item.id});
+      const response = await originalFetch.call(window, url, {credentials:'include', signal:controller.signal});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const data = await response.json();
+      if (data.status_msg || !data.aweme_detail) throw new Error(data.status_msg || '作品详情不可用');
+      const images = data.aweme_detail.images;
+      if (!Array.isArray(images) || !images.length) throw new Error('详情中没有图片');
+      return images.map(image => {
+        const raw = (Array.isArray(image.url_list) ? image.url_list : [])
+          .filter(url => typeof url === 'string' && /^https?:\/\//.test(url));
+        const preferred = raw.filter(url => !url.includes('.image?'));
+        return {kind:'image', urls: preferred.length ? [...preferred, ...raw.filter(url => url.includes('.image?'))] : raw};
+      });
+    } finally { clearTimeout(timer); }
+  }
+  async function exportManifest() {
+    if (exporting) { alert('下载清单正在生成，请稍候。'); return; }
+    const s = summary();
+    if (!s.items.length) { alert('尚未采集到作品，请先点击「喜欢」并滚动加载。'); return; }
+    exporting = true; pause();
+    const items = [], failures = [];
+    try {
+      let processed = 0;
+      for (const item of s.items) {
+        processed++;
+        let assets = item.assets;
+        if (item.note) {
+          state.textContent = `正在获取图文详情 ${processed}/${s.items.length}，请保持网页打开。失败 ${failures.length} 条。`;
+          try {
+            assets = await detailImages(item);
+            if (assets.some(image => !image.urls.length)) failures.push({id:item.id, reason:'部分图片缺少详情地址'});
+          } catch (error) {
+            assets = [];
+            failures.push({id:item.id, reason:String(error && error.message || error)});
+          }
+          await new Promise(resolve => setTimeout(resolve,300));
+        }
+        items.push({id:item.id, type:item.note ? 'note' : 'video', title:item.title, author:item.author, assets});
+      }
+      const manifest = {schema:'douyin-media-manifest/v1', createdAt:new Date().toISOString(), complete:s.complete,
+        note:'图文地址来自已登录页面获取的作品详情；是否无水印取决于网站实际返回。详情失败的作品没有图片地址。媒体地址可能过期。', detailFailures:failures, items};
+      const url = URL.createObjectURL(new Blob([JSON.stringify(manifest,null,2)],{type:'application/json;charset=utf-8'}));
+      const a=document.createElement('a'); a.href=url;
+      a.download=`抖音下载清单_${s.complete ? '已到末页' : '未确认完整'}_${items.length}条_图文详情失败${failures.length}条.json`;
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),10000);
+      message=`下载清单已生成；图文详情失败或缺图 ${failures.length} 条，可重新导出重试。`; render();
+      if (failures.length) alert(`下载清单已导出。${failures.length} 条图文详情获取失败或缺少图片地址，请检查登录或验证后重新导出。`);
+    } finally { exporting=false; }
+  }
+
+  const host = document.createElement('div'); host.dataset.unifiedCollector = 'true';
+  host.style.cssText = 'position:fixed;right:20px;top:90px;z-index:2147483647;width:320px;';
+  const root = host.attachShadow({ mode: 'open' });
+  const panel = document.createElement('div');
+  panel.style.cssText = 'background:#171923;color:#fff;border:1px solid #697080;border-radius:12px;padding:16px;font:14px/1.7 sans-serif;box-shadow:0 8px 24px #0008;';
+  const title = document.createElement('strong'); title.textContent = '抖音喜欢 → TXT';
+  const count = document.createElement('div');
+  const state = document.createElement('div'); state.style.cssText = 'margin:8px 0;color:#cad2e0;white-space:normal;';
+  panel.append(title, count, state);
+  function button(label, action) {
+    const b = document.createElement('button'); b.textContent = label;
+    b.style.cssText = 'display:block;width:100%;margin-top:8px;padding:7px;border:0;border-radius:7px;background:#eef1f7;color:#111;cursor:pointer;font:14px sans-serif;';
+    b.addEventListener('click', action); panel.appendChild(b); return b;
+  }
+  const autoButton = button('开始自动滚动', () => {
+    if (autoTimer !== null) { pause(); return; }
+    if (!active) { alert('采集已结束。重新采集需刷新页面并重新运行脚本。'); return; }
+    if (!pages.size) { alert('还没有读取到喜欢列表，请等待面板显示采集数量后再自动滚动。'); return; }
+    if (summary().complete) return;
+    lastProgress = Date.now(); autoButton.textContent = '暂停自动滚动';
+    autoTimer = setInterval(scrollOnce, 1800); scrollOnce();
+  });
+  button('导出视频 TXT', () => exportTxt('video'));
+  button('导出图文 TXT', () => exportTxt('note'));
+  button('导出全部作品 TXT（含图文）', () => exportTxt('all'));
+  button('导出下载清单 JSON', exportManifest);
+  function stop() {
+    pause(); active = false;
+    if (window.fetch === wrappedFetch) window.fetch = originalFetch;
+    if (XMLHttpRequest.prototype.open === wrappedOpen) XMLHttpRequest.prototype.open = originalOpen;
+    if (XMLHttpRequest.prototype.send === wrappedSend) XMLHttpRequest.prototype.send = originalSend;
+    message = '采集已结束；仍可导出已采集链接。尚未确认完整。'; render();
+  }
+  button('结束采集（保留导出）', stop);
+  root.appendChild(panel); document.body.appendChild(host);
+  window.fetch = wrappedFetch;
+  XMLHttpRequest.prototype.open = wrappedOpen;
+  XMLHttpRequest.prototype.send = wrappedSend;
+  window.__douyinLikesExport = {
+    stop,
+    status: () => { const s = summary(); return { pages: s.pages, items: s.items.length, complete: s.complete, invalid: s.invalid, firstPage: s.first, active }; },
+    links: () => summary().items.map(item => `https://www.douyin.com/${item.note ? 'note' : 'video'}/${item.id}`),
+    startAuto: () => { if (autoTimer === null && pages.size && !summary().complete) { lastProgress=Date.now(); autoTimer=setInterval(scrollOnce,1800); scrollOnce(); } },
+    async manifest() {
+      const snapshot=summary(), items=[], failures=[]; pause();
+      window.__douyinProgress={phase:'解析图片',done:0,total:snapshot.items.length,errors:0};
+      for(const item of snapshot.items) {
+        let assets=item.assets;
+        if(item.note) {
+          try { assets=await detailImages(item); if(assets.some(x=>!x.urls.length)) failures.push({id:item.id,reason:'图片地址缺失'}); }
+          catch(e) { assets=[]; failures.push({id:item.id,reason:String(e && e.message || e)}); }
+          await new Promise(resolve=>setTimeout(resolve,300));
+        }
+        items.push({id:item.id,type:item.note?'note':'video',title:item.title,author:item.author,assets});
+        window.__douyinProgress.done++; window.__douyinProgress.errors=failures.length;
+      }
+      return {schema:'douyin-media-manifest/v1',complete:snapshot.complete,detailFailures:failures,items};
+    }
+  };
+  render();
+  // 在用户已经打开喜欢时，页面可能已缓存首页，安装监听后重新触发列表加载。
+  // 仅切换可见的个人主页标签，不重新加载页面，也不请求其他账号。
+  function tab(label) {
+    const nodes = [...document.querySelectorAll('[role="tab"], button, a, span')];
+    for (const node of nodes) {
+      if (!node.getClientRects().length || !new RegExp('^' + label + '(?:\\s*\\d+)?$').test((node.textContent || '').trim())) continue;
+      const target = node.closest('[role="tab"], button, a') || node;
+      if (target.tagName === 'A' && target.href) {
+        const destination = new URL(target.href, location.href);
+        if (destination.origin !== location.origin || destination.pathname !== location.pathname) continue;
+      }
+      return target;
+    }
+    return null;
+  }
+  setTimeout(() => {
+    if (!active || pages.size) return;
+    const works = tab('作品'), likes = tab('喜欢');
+    if (!works || !likes || works === likes) {
+      message = '未找到主页标签，请确认当前页面是自己的个人主页。'; render(); return;
+    }
+    works.click();
+    setTimeout(() => {
+      if (!active || pages.size) return;
+      const currentLikes = tab('喜欢');
+      if (currentLikes) currentLikes.click();
+      setTimeout(() => {
+        if (active && !pages.size) {
+          message = '自动切换后没有读到列表，网页可能使用了缓存或界面已变化，暂时不能确认完整。'; render();
+        }
+      }, 5000);
+    }, 1000);
+  }, 500);
+  console.info('喜欢链接采集已启动，正在自动准备列表。刷新或关闭页面会清空本次采集。');
+})();

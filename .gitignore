@@ -1,0 +1,6 @@
+build/
+*.user
+*.suo
+BrowserProfile/
+下载结果/
+*.part
