@@ -27,4 +27,4 @@ Windows 本地软件，用于从自己的抖音“喜欢”页面采集列表，
 
 Windows 自带 .NET Framework 4.x 编译器的环境下，双击 `build.cmd`，生成文件位于 `build\DouyinLikes.exe`。源码位于 `src`，其中 `unified-collector.js` 会被嵌入程序。
 
-本工具参考 [阿抖 1.5.8 修改版](https://github.com/I5858555255/adou-extension-1.5.8) 的作品详情处理方式，并使用用户提供的喜欢列表采集脚本。请尊重作品作者的权益，并遵守平台规则。
+请尊重作品作者的权益，并遵守平台规则。
